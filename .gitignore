@@ -1,0 +1,95 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Entornos virtuales
+venv/
+env/
+ENV/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# Configuraciones y claves
+*.env
+config.ini
+config.json
+*.config
+credentials.json
+secrets.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.out
+
+# Imágenes y datos de prueba
+data/personal/
+test_images/
+samples/
+uploads/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# Modelos y archivos grandes
+models/
+*.h5
+*.pkl
+*.model
+*.weights
+*.pt
+*.pth
+*.onnx
+
+# Archivos específicos de los IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Archivos temporales
+.ipynb_checkpoints/
+tmp/
+temp/
+.~lock.*
+*.bak
+*.tmp
+
+# Archivos específicos de reconocimiento de ID
+tokens/
+temp_images/
+processed_images/
+output/
+cache/ 
