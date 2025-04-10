@@ -29,6 +29,7 @@ ENV/
 .venv
 env.bak/
 venv.bak/
+Scripts/
 
 # Configuraciones y claves
 *.env
