@@ -2,7 +2,7 @@ import openai
 import json
 from PIL import Image
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated
 from dateutil import parser
 from ImageAnalyzer import extract_json, analyze_date
@@ -28,6 +28,9 @@ def analyze_text_openai(text):
             "\n3. ExpiryDate is typically located near the word 'VALIDEZ' and is a future date (later than DateOfBirth)."
             "\n4. NEVER confuse ExpiryDate with DateOfBirth - they are different dates with different purposes."
             "\n5. In Spanish DNI cards, the ExpiryDate is always a future date, while DateOfBirth is always in the past."
+            "\n6. In Spanish DNI cards, the ExpiryDate is often found after or near 'VALIDEZ' or after the document number/support number."
+            "\n7. If multiple dates are present, the most future date is likely the ExpiryDate."
+            "\n8. Pay special attention to finding the ExpiryDate even if it's not clearly labeled with 'VALIDEZ'."
             "\n\nMake sure to extract the DNI number correctly - it's usually at the bottom of the card and may end with a letter. "
             "The sex will be 'M' for male or 'F' for female. The nationality is usually a 3-letter code like 'ESP' for Spain. "
             "\n\nReturn ONLY a JSON object with the exact field names specified above, no additional explanations. "
@@ -61,9 +64,9 @@ def analyze_date(date):
         # Analiza la fecha en varios formatos
         fecha = parser.parse(date, dayfirst=True)  # Priorizar formato día/mes/año (europeo)
     except (ValueError, TypeError):
-        # Si ocurre un error, devolver 31 de diciembre de 1969
-        print("Error al analizar la fecha, devolviendo fecha predeterminada.")
-        fecha = datetime(1969, 12, 31)
+        # Si ocurre un error, devolver cadena vacía en lugar de fecha por defecto
+        print("Error al analizar la fecha, devolviendo cadena vacía.")
+        return ""
     
     # Retorna la fecha en formato dd/mm/yyyy
     return fecha.strftime("%d/%m/%Y")
@@ -83,38 +86,87 @@ def fallback_text_analysis(text):
         "ExpiryDate": ""
     }
     
+    # Lista de palabras que NO deben estar en los apellidos
+    palabras_excluidas = ["NUM", "SOPORT", "GOPORT", "DOCUMENTO", "NACIONAL", "IDENTIDAD", 
+                         "ESPAÑA", "VALIDEZ", "DNI", "FECHA", "NACIMIENTO", "NOMBRE", "SEXO", 
+                         "APELLIDOS", "APELLIDO"]
+    
     # Buscar nombre después de "NOMBRE"
     name_match = re.search(r'NOMBRE\s*[:\s]*([A-ZÁÉÍÓÚÜÑa-záéíóúüñ]+)', text)
     if name_match:
         result["Name"] = name_match.group(1).strip()
     
-    # Buscar apellidos después de "APELLIDOS" - expresión mejorada
-    lastname_patterns = [
-        r'APELLIDOS\s*[:\s]*([A-ZÁÉÍÓÚÜÑa-záéíóúüñ\s]+)(?=\s*NOMBRE)',  # Busca hasta NOMBRE
-        r'APELLIDOS\s*[:\s]*([A-ZÁÉÍÓÚÜÑa-záéíóúüñ\s]+)',  # Cualquier texto después de APELLIDOS
-    ]
+    # Buscar apellidos después de "APELLIDOS" - recuperando ambos apellidos
+    # Primero buscar líneas que contengan APELLIDOS
+    apellidos_completos = None
+    lineas = text.split('\n')
     
-    for pattern in lastname_patterns:
-        lastname_match = re.search(pattern, text)
-        if lastname_match:
-            result["Lastname"] = lastname_match.group(1).strip()
-            break
+    # Buscar líneas específicas con APELLIDOS
+    for i, linea in enumerate(lineas):
+        # Si la línea contiene APELLIDOS
+        if "APELLIDOS" in linea:
+            # Extraer los apellidos de la misma línea
+            apellidos_texto = linea.replace("APELLIDOS", "").strip()
+            
+            # Si no hay suficiente texto en la misma línea o parece incompleto, buscar en líneas siguientes
+            if not apellidos_texto or len(apellidos_texto.split()) < 2:
+                # Comprobar si hay más líneas disponibles
+                if i+1 < len(lineas) and i+2 < len(lineas):
+                    # Considerar que los apellidos pueden estar en 1 o 2 líneas siguientes
+                    linea_siguiente = lineas[i+1].strip()
+                    linea_siguiente2 = lineas[i+2].strip()
+                    
+                    # Si la línea siguiente parece un apellido (solo mayúsculas y sin palabras excluidas)
+                    if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente) and not any(palabra in linea_siguiente for palabra in palabras_excluidas):
+                        # Si la segunda línea también parece apellido, combinarlos
+                        if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente2) and not any(palabra in linea_siguiente2 for palabra in palabras_excluidas):
+                            apellidos_completos = f"{linea_siguiente} {linea_siguiente2}"
+                        else:
+                            apellidos_completos = linea_siguiente
+                    elif apellidos_texto:
+                        # Si ya hay texto en la línea de APELLIDOS, usarlo
+                        apellidos_completos = apellidos_texto
+            else:
+                # Si hay suficiente texto en la misma línea, usarlo
+                apellidos_completos = apellidos_texto
+            
+            # Si encontramos apellidos, salir del bucle
+            if apellidos_completos:
+                break
     
-    # Buscar apellidos genéricos sin hardcoding
-    if not result["Lastname"]:
-        # Buscar cualquier texto que parezca apellido después de APELLIDOS
-        apellido_match = re.search(r'APELLIDOS[:\s]+([A-ZÁÉÍÓÚÜÑa-záéíóúüñ\s]+)', text)
-        if apellido_match:
-            result["Lastname"] = apellido_match.group(1).strip()
+    # Si encontramos apellidos en el análisis por líneas, usarlos
+    if apellidos_completos:
+        result["Lastname"] = apellidos_completos
+    else:
+        # Si no, intentar con patrones regex más generales
+        # Buscar apellidos completos (primer y segundo apellido)
+        apellidos_match = re.search(r'APELLIDOS\s*[:\s]*([A-ZÁÉÍÓÚÑ\s]+)', text)
+        if apellidos_match:
+            apellidos_candidato = apellidos_match.group(1).strip()
+            # Verificar que no contenga palabras excluidas
+            if not any(palabra in apellidos_candidato for palabra in palabras_excluidas):
+                result["Lastname"] = apellidos_candidato
+        else:
+            # Buscar patrones específicos de documentos españoles con dos apellidos
+            for i, linea in enumerate(lineas):
+                # Buscar líneas que parezcan contener exclusivamente apellidos (dos palabras en mayúsculas)
+                if re.match(r'^[A-ZÁÉÍÓÚÑ]+\s+[A-ZÁÉÍÓÚÑ]+$', linea.strip()):
+                    # Verificar que no sean palabras prohibidas
+                    if not any(palabra in linea for palabra in palabras_excluidas + ["NOMBRE", "APELLIDOS", "NACIONALIDAD"]):
+                        result["Lastname"] = linea.strip()
+                        break
     
     # Buscar fecha de nacimiento (patrón común en DNI español: DD MM YYYY)
     dob_patterns = [
         r'FECHA DE NACIMIENTO\s*[:\s]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})',  # Formato español
         r'FECHA[.\s]+NAC[.\s]+(?:.*?)(\d{1,2})[/\s.-](\d{1,2})[/\s.-](\d{4})',  # Variación
+        r'NACIMIENTO[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})',  # Después de NACIMIENTO
         r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})',  # Números separados por espacios
         r'(\d{1,2})[/\s.-](\d{1,2})[/\s.-](\d{2,4})',  # Formatos generales
     ]
     
+    fecha_nacimiento = None
+    fecha_nacimiento_obj = None
     for pattern in dob_patterns:
         match = re.search(pattern, text)
         if match:
@@ -122,43 +174,87 @@ def fallback_text_analysis(text):
             if len(year) == 2:
                 year = '19' + year if int(year) > 50 else '20' + year
             # Verificamos que se trata de una fecha española (DD/MM/YYYY)
-            if int(day) <= 31 and int(month) <= 12:
-                result["DateOfBirth"] = f"{day}/{month}/{year}"
-            else:
-                # Si parece invertida, la corregimos
-                result["DateOfBirth"] = f"{month}/{day}/{year}"
-            break
+            if int(day) <= 31 and int(month) <= 12 and 1900 <= int(year) <= 2100:
+                fecha_nacimiento = f"{day}/{month}/{year}"
+                # Guardar también la fecha como objeto para comparaciones
+                try:
+                    fecha_nacimiento_obj = datetime(int(year), int(month), int(day))
+                    result["DateOfBirth"] = fecha_nacimiento
+                    break
+                except (ValueError, TypeError):
+                    # Si la fecha no es válida, continuamos con el siguiente patrón
+                    continue
     
-    # Buscar fecha de validez (patrón similar a la fecha de nacimiento)
-    validez_patterns = [
-        r'VALIDEZ\s*[:\s]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})',  # Formato español
-        r'VALID[EZ]*\s*[:\s]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})',  # Variación
-        r'VALIDEZ.*?(\d{1,2})[\s./]+(\d{1,2})[\s./]+(\d{4})',  # Más flexible, busca números cerca de VALIDEZ
-    ]
+    # Búsqueda específica de fecha de validez después de la palabra VALIDEZ
+    validez_fecha = None
+    if "VALIDEZ" in text:
+        # Obtener texto después de VALIDEZ (hasta 40 caracteres)
+        validez_idx = text.find("VALIDEZ")
+        if validez_idx >= 0:
+            texto_despues = text[validez_idx:validez_idx+40]
+            # Buscar patrón de fecha específicamente del formato DD MM YYYY
+            fecha_match = re.search(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', texto_despues)
+            if fecha_match:
+                day, month, year = fecha_match.groups()
+                # Validar que sea una fecha razonable (no años extremadamente lejanos)
+                if int(day) <= 31 and int(month) <= 12 and 2000 <= int(year) <= 2050:
+                    validez_fecha = f"{day}/{month}/{year}"
+                    result["ExpiryDate"] = validez_fecha
     
-    for pattern in validez_patterns:
-        match = re.search(pattern, text)
-        if match:
-            day, month, year = match.groups()
-            if len(year) == 2:
-                year = '20' + year  # Asumimos que la fecha de validez es futura
-            result["ExpiryDate"] = f"{day}/{month}/{year}"
-            break
+    # Si no encontramos fecha de validez específica, buscar cerca de texto indicativo
+    if not result["ExpiryDate"]:
+        # Buscar después de palabras clave como NUM SOPORT, BGM, etc.
+        soport_matches = re.finditer(r'(NUM\s*[GSC]OPORT|BGM|[A-Z]{2,3}\d{5,})', text)
+        for match in soport_matches:
+            # Examinar el texto después del match hasta 40 caracteres
+            texto_despues = text[match.end():min(match.end()+40, len(text))]
+            
+            # Buscar específicamente patrones como "26 03 2028" (con espacios) primero
+            fecha_match = re.search(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', texto_despues)
+            if fecha_match:
+                day, month, year = fecha_match.groups()
+                # Validar la fecha: debe ser razonable y posterior a hoy
+                if 1 <= int(day) <= 31 and 1 <= int(month) <= 12 and 2000 <= int(year) <= 2050:
+                    try:
+                        fecha_obj = datetime(int(year), int(month), int(day))
+                        # Debe ser una fecha futura o cercana a hoy
+                        if fecha_obj > datetime.now() - timedelta(days=365):
+                            result["ExpiryDate"] = f"{day}/{month}/{year}"
+                    except (ValueError, TypeError):
+                        continue
     
-    # Si no encontramos fecha de validez, buscamos específicamente cerca de la palabra VALIDEZ
-    if not result["ExpiryDate"] and "VALIDEZ" in text:
-        # Intentar buscar números cerca de "VALIDEZ"
-        text_after_validez = text[text.find("VALIDEZ"):]
-        # Buscar patrones de números que puedan ser fechas
-        fecha_match = re.search(r'(\d{1,2})[\s./]+(\d{1,2})[\s./]+(\d{4})', text_after_validez)
-        if fecha_match:
-            day, month, year = fecha_match.groups()
-            result["ExpiryDate"] = f"{day}/{month}/{year}"
-        else:
-            # Buscar patrones de números que puedan ser fechas
-            numeros = re.findall(r'\d+', text_after_validez)
-            if len(numeros) >= 3:  # Si encontramos al menos 3 números, asumimos día, mes, año
-                result["ExpiryDate"] = f"{numeros[0]}/{numeros[1]}/{numeros[2]}"
+    # Buscar patrones específicos para fecha de validez
+    if not result["ExpiryDate"]:
+        # Buscar únicamente fechas futuras en el texto con formato específico para años 20XX
+        fechas_futuras = []
+        patron_fecha_futura = r'(\d{1,2})\s+(\d{1,2})\s+20(\d{2})'
+        for match in re.finditer(patron_fecha_futura, text):
+            day, month, year_short = match.groups()
+            year = "20" + year_short
+            # Validar componentes de la fecha
+            if 1 <= int(day) <= 31 and 1 <= int(month) <= 12 and 2000 <= int(year) <= 2050:
+                try:
+                    fecha_obj = datetime(int(year), int(month), int(day))
+                    # Agregar si es fecha futura o cercana a hoy
+                    if fecha_obj > datetime.now() - timedelta(days=365):
+                        # Calcular posición en el texto
+                        pos = match.start()
+                        # Si está cerca de VALIDEZ o NUM SOPORT, darle mayor prioridad
+                        prioridad = 0
+                        if "VALIDEZ" in text[max(0, pos-20):pos]:
+                            prioridad = 2  # Mayor prioridad si está después de VALIDEZ
+                        elif any(palabra in text[max(0, pos-30):pos] for palabra in ["SOPORT", "BGM", "NUM"]):
+                            prioridad = 1  # Prioridad media si está después de número de soporte
+                        
+                        fechas_futuras.append((fecha_obj, f"{day}/{month}/{year}", prioridad))
+                except (ValueError, TypeError):
+                    continue
+        
+        # Si encontramos fechas futuras, usar la que tenga mayor prioridad o sea más cercana
+        if fechas_futuras:
+            # Ordenar por prioridad (descendente) y luego por fecha (ascendente)
+            fechas_futuras.sort(key=lambda x: (-x[2], x[0]))
+            result["ExpiryDate"] = fechas_futuras[0][1]
     
     # Buscar sexo (M o F)
     sexo_patterns = [
@@ -204,6 +300,30 @@ def fallback_text_analysis(text):
     return json.dumps(result, ensure_ascii=False)
 
 
+def es_fecha_valida(dia, mes, anio):
+    """Verifica si una fecha es válida y razonable para un documento de identidad"""
+    try:
+        # Validar componentes básicos
+        if not (1 <= int(dia) <= 31 and 1 <= int(mes) <= 12):
+            return False
+            
+        # Validar año razonable (no fechas extremas)
+        anio_int = int(anio)
+        if not (1900 <= anio_int <= 2100):
+            return False
+            
+        # Verificar que la fecha sea válida (ej: no 31 de febrero)
+        fecha_obj = datetime(anio_int, int(mes), int(dia))
+        
+        # Para fechas de validez, asegurarse que no sean extremadamente lejanas
+        if anio_int > datetime.now().year + 30:
+            return False
+            
+        return True
+    except ValueError:
+        return False
+
+
 def analyze_id_type(id_type):
     id_type = id_type.lower()  # Convertimos todo el texto a minúsculas para facilitar comparaciones
     
@@ -230,29 +350,61 @@ def final_json(extracted_data):
     if(extracted_data):
         new_json = {}
 
-        if "Name" in extracted_data:
+        if "Name" in extracted_data and extracted_data["Name"]:
             new_json["Nombre"] = extracted_data["Name"]
-        if "Lastname" in extracted_data:
+        else:
+            new_json["Nombre"] = ""
+            
+        if "Lastname" in extracted_data and extracted_data["Lastname"]:
             new_json["Apellido"] = extracted_data["Lastname"]
-        if "DocumentNumber" in extracted_data:
+        else:
+            new_json["Apellido"] = ""
+            
+        if "DocumentNumber" in extracted_data and extracted_data["DocumentNumber"]:
             new_json["Documento"] = extracted_data["DocumentNumber"]
-        if "DateOfBirth" in extracted_data:
+        else:
+            new_json["Documento"] = ""
+            
+        if "DateOfBirth" in extracted_data and extracted_data["DateOfBirth"]:
             fechaDeNacimiento = analyze_date(extracted_data["DateOfBirth"])
             new_json["FechaDeNacimiento"] = fechaDeNacimiento
-        if "DocumentType" in extracted_data:
+        else:
+            new_json["FechaDeNacimiento"] = ""
+            
+        if "DocumentType" in extracted_data and extracted_data["DocumentType"]:
             tipoDocumento = analyze_id_type(extracted_data["DocumentType"])
             new_json["TipoDocumento"] = tipoDocumento
-        if "Sex" in extracted_data:
+        else:
+            new_json["TipoDocumento"] = ""
+            
+        if "Sex" in extracted_data and extracted_data["Sex"]:
             new_json["Sexo"] = extracted_data["Sex"]
-        if "Nationality" in extracted_data:
+        else:
+            new_json["Sexo"] = ""
+            
+        if "Nationality" in extracted_data and extracted_data["Nationality"]:
             new_json["Nacionalidad"] = extracted_data["Nationality"]
-        if "ExpiryDate" in extracted_data:
+        else:
+            new_json["Nacionalidad"] = ""
+            
+        if "ExpiryDate" in extracted_data and extracted_data["ExpiryDate"]:
             fechaValidez = analyze_date(extracted_data["ExpiryDate"])
             new_json["FechaValidez"] = fechaValidez
+        else:
+            new_json["FechaValidez"] = ""
 
         return new_json
     else:
-        return "No se encontró un JSON válido."
+        return {
+            "Nombre": "",
+            "Apellido": "",
+            "Documento": "",
+            "FechaDeNacimiento": "",
+            "TipoDocumento": "",
+            "Sexo": "",
+            "Nacionalidad": "",
+            "FechaValidez": ""
+        }
 
 def analyze_id(text):
     try:
@@ -281,24 +433,8 @@ def analyze_id(text):
                         "ExpiryDate": ""
                     }
         
-        # Correcciones para mejorar fechas sin hardcoding
-        
-        # Buscar fechas de nacimiento y validez en el texto
-        fechas_encontradas = re.findall(r'(\d{1,2})[\s./]+(\d{1,2})[\s./]+(\d{4})', text)
-        fechas_ordenadas = []
-        
-        for dia, mes, anio in fechas_encontradas:
-            try:
-                # Convertir a objeto datetime para comparar
-                fecha_actual = datetime(int(anio), int(mes), int(dia))
-                fechas_ordenadas.append(fecha_actual)
-            except (ValueError, TypeError):
-                continue
-        
-        # Ordenamos las fechas de más antigua a más reciente
-        fechas_ordenadas.sort()
-        
         # Búsqueda específica para DNI español si no se encontraron ciertos campos
+        # Restaurar detección de sexo y nacionalidad
         if not openai_json.get("Sex") and "SEXO" in text:
             sexo_match = re.search(r'SEXO\s*[:\s]*([MF])', text)
             if sexo_match:
@@ -309,33 +445,226 @@ def analyze_id(text):
         if not openai_json.get("Nationality") and "ESP" in text:
             openai_json["Nationality"] = "ESP"
         
+        # Lista de palabras que NO deben estar en los apellidos
+        palabras_excluidas_apellidos = ["NUM", "SOPORT", "GOPORT", "DOCUMENTO", "NACIONAL", "IDENTIDAD", 
+                                       "ESPAÑA", "VALIDEZ", "DNI", "FECHA", "NACIMIENTO", "NOMBRE", "SEXO", 
+                                       "APELLIDOS", "APELLIDO"]
+        
+        # Variables para almacenar fechas encontradas
+        fechas_encontradas = []
+        
+        # Procesar todas las fechas en el texto para clasificarlas correctamente
+        for match in re.finditer(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', text):
+            dia, mes, anio = match.groups()
+            if es_fecha_valida(dia, mes, anio):
+                try:
+                    fecha_obj = datetime(int(anio), int(mes), int(dia))
+                    # Obtener el contexto antes de la fecha
+                    inicio_pos = max(0, match.start() - 30)
+                    fin_pos = match.start()
+                    contexto_antes = text[inicio_pos:fin_pos]
+                    
+                    # Determinar tipo de fecha según contexto
+                    tipo_fecha = "desconocido"
+                    if "NACIMIENTO" in contexto_antes:
+                        tipo_fecha = "nacimiento"
+                    elif "VALIDEZ" in contexto_antes:
+                        tipo_fecha = "validez"
+                    # Si es fecha futura, probablemente es de validez
+                    elif fecha_obj > datetime.now():
+                        tipo_fecha = "validez"
+                    # Si está cerca de patrones típicos de fechas de validez
+                    elif re.search(r'BGM\d+|SOPORT|NUM', contexto_antes):
+                        tipo_fecha = "validez"
+                    
+                    fechas_encontradas.append({
+                        "fecha": fecha_obj,
+                        "texto": f"{dia}/{mes}/{anio}",
+                        "tipo": tipo_fecha,
+                        "posicion": match.start()
+                    })
+                except ValueError:
+                    pass
+        
+        # DETECCIÓN DE APELLIDOS MEDIANTE BÚSQUEDA DE CONTEXTO
+        # Para evitar el hardcoding, buscamos patrones comunes en los DNI
+        
+        # 1. Buscar después del texto "APELLIDOS"
+        apellidos_completos = None
+        lineas = text.split('\n')
+        
+        for i, linea in enumerate(lineas):
+            if "APELLIDOS" in linea:
+                # Extraer texto después de la palabra APELLIDOS
+                apellido_texto = linea.replace("APELLIDOS", "").strip()
+                
+                # Si hay apellidos en la misma línea
+                if apellido_texto and not any(p in apellido_texto for p in palabras_excluidas_apellidos):
+                    # Verificar si es formato típico de apellido
+                    if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', apellido_texto):
+                        apellidos_completos = apellido_texto
+                
+                # Si no hay texto en la línea o es insuficiente, buscar en líneas siguientes
+                if not apellidos_completos and i + 1 < len(lineas):
+                    linea_siguiente = lineas[i+1].strip()
+                    # Si la siguiente línea parece un apellido
+                    if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente) and not any(p in linea_siguiente for p in palabras_excluidas_apellidos):
+                        apellidos_completos = linea_siguiente
+                        
+                        # Si hay más líneas, verificar si hay un segundo apellido
+                        if i + 2 < len(lineas):
+                            linea_siguiente2 = lineas[i+2].strip()
+                            # Si la línea siguiente también parece un apellido
+                            if re.match(r'^[A-ZÁÉÍÓÚÑ]+$', linea_siguiente2) and not any(p in linea_siguiente2 for p in palabras_excluidas_apellidos):
+                                # Combinar ambos apellidos
+                                apellidos_completos = f"{apellidos_completos} {linea_siguiente2}"
+                break
+        
+        # 2. Si no encontramos con el método anterior, buscar líneas con formato de apellidos
+        if not apellidos_completos:
+            # Buscar líneas con texto en mayúsculas que no contengan palabras excluidas
+            for i, linea in enumerate(lineas):
+                # Si es una línea de solo mayúsculas y sin palabras excluidas
+                if (re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea.strip()) and 
+                    len(linea.strip()) > 3 and 
+                    not any(p in linea.upper() for p in palabras_excluidas_apellidos)):
+                    
+                    # Verificar si la línea siguiente también parece un apellido
+                    if i + 1 < len(lineas):
+                        linea_siguiente = lineas[i+1].strip()
+                        if (re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente) and 
+                            len(linea_siguiente) > 3 and 
+                            not any(p in linea_siguiente.upper() for p in palabras_excluidas_apellidos)):
+                            
+                            # Si tenemos dos líneas seguidas que parecen apellidos, combinarlas
+                            apellidos_completos = f"{linea.strip()} {linea_siguiente.strip()}"
+                            break
+                    
+                    # Si solo encontramos una línea que parece apellido, usarla
+                    apellidos_completos = linea.strip()
+                    break
+        
+        # 3. Estrategia adicional: buscar patrones de dos palabras mayúsculas juntas
+        if not apellidos_completos:
+            # Buscar líneas con exactamente dos palabras en mayúsculas (formato típico: PRIMER SEGUNDO)
+            for linea in lineas:
+                palabras = linea.strip().split()
+                if len(palabras) == 2:
+                    if (all(re.match(r'^[A-ZÁÉÍÓÚÑ]+$', palabra) for palabra in palabras) and
+                        not any(p in linea.upper() for p in palabras_excluidas_apellidos)):
+                        apellidos_completos = linea.strip()
+                        break
+        
+        # Actualizar el JSON con los apellidos encontrados
+        if apellidos_completos:
+            openai_json["Lastname"] = apellidos_completos
+        
+        # Clasificar y asignar fechas según su tipo
+        fecha_nacimiento = None
+        fecha_validez = None
+        
+        # Primero, buscar específicamente fechas etiquetadas
+        for fecha in fechas_encontradas:
+            if fecha["tipo"] == "nacimiento":
+                fecha_nacimiento = fecha["texto"]
+            elif fecha["tipo"] == "validez":
+                fecha_validez = fecha["texto"]
+        
+        # Si no encontramos fecha de nacimiento etiquetada, buscar la más antigua
+        if not fecha_nacimiento and fechas_encontradas:
+            fechas_pasadas = [f for f in fechas_encontradas if f["fecha"] < datetime.now()]
+            if fechas_pasadas:
+                fechas_pasadas.sort(key=lambda x: x["fecha"])  # Ordenar de más antigua a más reciente
+                fecha_nacimiento = fechas_pasadas[0]["texto"]
+        
+        # Si no encontramos fecha de validez etiquetada, buscar la más futura
+        if not fecha_validez and fechas_encontradas:
+            fechas_futuras = [f for f in fechas_encontradas if f["fecha"] > datetime.now()]
+            if fechas_futuras:
+                fechas_futuras.sort(key=lambda x: x["fecha"])  # Ordenar de más cercana a más lejana
+                fecha_validez = fechas_futuras[0]["texto"]
+            # Si no hay fechas futuras, buscar la más reciente que esté cerca de "VALIDEZ" o "BGM"
+            else:
+                for fecha in fechas_encontradas:
+                    inicio_pos = max(0, fecha["posicion"] - 30)
+                    contexto = text[inicio_pos:fecha["posicion"]]
+                    if "VALIDEZ" in contexto or "BGM" in contexto or "SOPORT" in contexto:
+                        fecha_validez = fecha["texto"]
+                        break
+        
+        # Actualizar fechas en el JSON
+        if fecha_nacimiento:
+            openai_json["DateOfBirth"] = fecha_nacimiento
+        
+        if fecha_validez:
+            openai_json["ExpiryDate"] = fecha_validez
+        
+        # Búsqueda específica para fecha de validez (formato DD MM YYYY)
+        if not openai_json.get("ExpiryDate") and "VALIDEZ" in text:
+            validez_idx = text.find("VALIDEZ")
+            if validez_idx >= 0:
+                texto_despues = text[validez_idx:validez_idx+40]
+                # Buscar fecha en formato DD MM YYYY cerca de VALIDEZ
+                validez_match = re.search(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', texto_despues)
+                if validez_match:
+                    dia, mes, anio = validez_match.groups()
+                    openai_json["ExpiryDate"] = f"{dia}/{mes}/{anio}"
+        
+        # IMPORTANTE: Asegurarse de que la fecha de validez no sea igual a la fecha de nacimiento
+        if (openai_json.get("ExpiryDate") and openai_json.get("DateOfBirth") and 
+            openai_json["ExpiryDate"] == openai_json["DateOfBirth"]):
+            # Si son iguales, es probable un error - buscar otra fecha que pueda ser la de validez
+            print("¡ALERTA! La fecha de validez es igual a la fecha de nacimiento. Buscando otra fecha...")
+            # Buscar explícitamente cerca de VALIDEZ o después de SOPORT
+            for patrón, contexto in [
+                (r'VALIDEZ[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "VALIDEZ"),
+                (r'BGM\d+\s+(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "SOPORTE"),
+                (r'SOPORT[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "SOPORTE")
+            ]:
+                match = re.search(patrón, text)
+                if match:
+                    dia, mes, anio = match.groups()
+                    nueva_fecha = f"{dia}/{mes}/{anio}"
+                    # Verificar que sea diferente a la fecha de nacimiento
+                    if nueva_fecha != openai_json["DateOfBirth"]:
+                        openai_json["ExpiryDate"] = nueva_fecha
+                        print(f"Nueva fecha de validez encontrada cerca de {contexto}: {nueva_fecha}")
+                        break
+            
+            # Si aún son iguales, dejar vacía la fecha de validez para evitar confusiones
+            if openai_json.get("ExpiryDate") == openai_json.get("DateOfBirth"):
+                openai_json["ExpiryDate"] = ""
+                print("No se pudo encontrar una fecha de validez clara y distinta. Dejando campo vacío.")
+        
+        # Convertir y formatear el resultado
         id_json = final_json(openai_json)
         
-        # Verificación final para fecha de validez
-        if "FechaValidez" in id_json and "FechaDeNacimiento" in id_json:
-            if id_json["FechaValidez"] == id_json["FechaDeNacimiento"]:
-                # Si la fecha de validez es igual a la fecha de nacimiento, es un error
-                # Buscar la fecha más reciente (probablemente es la de validez)
-                if fechas_ordenadas and len(fechas_ordenadas) > 1:
-                    fecha_mas_reciente = fechas_ordenadas[-1]  # La última es la más reciente
-                    id_json["FechaValidez"] = fecha_mas_reciente.strftime("%d/%m/%Y")
+        # VERIFICACIONES FINALES
+        # Si falta nacionalidad para DNI español
+        if not id_json.get("Nacionalidad") and id_json.get("TipoDocumento") == "DNI":
+            id_json["Nacionalidad"] = "ESP"
         
-        # Si no encontramos fecha de validez pero tenemos fechas ordenadas
-        if ("FechaValidez" not in id_json or not id_json["FechaValidez"]) and fechas_ordenadas:
-            # La fecha más reciente suele ser la fecha de validez
-            if len(fechas_ordenadas) > 1:
-                fecha_mas_reciente = fechas_ordenadas[-1]
-                fecha_actual = datetime.now()
-                
-                # Si es una fecha futura, probablemente es la fecha de validez
-                if fecha_mas_reciente > fecha_actual:
-                    id_json["FechaValidez"] = fecha_mas_reciente.strftime("%d/%m/%Y")
-                # Si no es futura, buscamos específicamente cerca de "VALIDEZ"
-                elif "VALIDEZ" in text:
-                    text_after_validez = text[text.find("VALIDEZ"):]
-                    for dia, mes, anio in re.findall(r'(\d{1,2})[\s./]+(\d{1,2})[\s./]+(\d{4})', text_after_validez):
-                        id_json["FechaValidez"] = f"{dia}/{mes}/{anio}"
-                        break
+        # Si falta sexo pero está en el texto
+        if not id_json.get("Sexo") and "SEXO" in text:
+            if "SEXO M" in text:
+                id_json["Sexo"] = "M"
+            elif "SEXO F" in text:
+                id_json["Sexo"] = "F"
+        
+        # Verificación final para evitar que la palabra APELLIDOS aparezca como apellido
+        if id_json.get("Apellido") == "APELLIDOS":
+            id_json["Apellido"] = ""
+        
+        # Última comprobación para evitar que la fecha de validez sea igual a la fecha de nacimiento
+        if id_json.get("FechaValidez") == id_json.get("FechaDeNacimiento"):
+            # Buscar explícitamente la fecha después de VALIDEZ
+            validez_match = re.search(r'VALIDEZ[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', text)
+            if validez_match:
+                dia, mes, anio = validez_match.groups()
+                id_json["FechaValidez"] = f"{dia}/{mes}/{anio}"
+            else:
+                # Si no se encuentra, dejar el campo vacío
+                id_json["FechaValidez"] = ""
         
         print(id_json)
         return id_json
@@ -343,7 +672,12 @@ def analyze_id(text):
         print(f"Error en análisis de ID: {str(e)}")
         # Fallback básico para evitar error completo
         return {
-            "Mensaje": "Error en el procesamiento",
-            "Error": str(e),
-            "TextoExtraido": text[:100] + "..." if len(text) > 100 else text
+            "Nombre": "",
+            "Apellido": "",
+            "Documento": "",
+            "FechaDeNacimiento": "",
+            "TipoDocumento": "",
+            "Sexo": "",
+            "Nacionalidad": "",
+            "FechaValidez": ""
         }
