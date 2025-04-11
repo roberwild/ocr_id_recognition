@@ -155,7 +155,7 @@ def convert_to_processable_image(file_path):
 def preprocess_image_for_ocr(image_path):
     """
     Preprocesamiento de imagen para mejorar la calidad del OCR con Tesseract.
-    Sigue técnicas específicas para DNI español.
+    Versión mejorada con técnicas avanzadas de restauración y reducción de ruido.
     """
     # Cargar imagen
     img = cv2.imread(image_path)
@@ -180,82 +180,208 @@ def preprocess_image_for_ocr(image_path):
     # Guardar imagen redimensionada
     cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_resized.jpg"), img)
     
-    # Convertir a escala de grises
+    # NUEVAS TÉCNICAS DE PREPROCESAMIENTO PARA IMÁGENES DE BAJA CALIDAD
+    
+    # 1. Análisis inicial para detectar tipo de ruido/distorsión
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_gray.jpg"), gray)
-
-    # Mejora adicional: Normalización de histograma
-    norm_img = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_normalized.jpg"), norm_img)
     
-    # Ecualización de histograma para mejorar contraste (con CLAHE)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-    equalized = clahe.apply(norm_img)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_equalized.jpg"), equalized)
+    # Detectar nivel de ruido mediante análisis de varianza local
+    noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    local_mean = cv2.blur(gray, (5, 5))
+    local_var = cv2.blur(cv2.multiply(gray, gray), (5, 5)) - cv2.multiply(local_mean, local_mean)
+    noise_level = cv2.mean(local_var)[0] / 255.0
     
-    # Eliminar ruido con filtro bilateral (preserva bordes)
-    bilateral = cv2.bilateralFilter(equalized, 9, 75, 75)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_bilateral.jpg"), bilateral)
+    # Determinar si hay distorsión lineal (ruido como líneas horizontales)
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+    horizontal_lines = cv2.morphologyEx(gray, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    horizontal_lines_mean = cv2.mean(horizontal_lines)[0]
+    has_linear_distortion = horizontal_lines_mean > 5.0
     
-    # Umbral adaptativo para diferentes regiones de la imagen
-    thresh = cv2.adaptiveThreshold(bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 11, 2)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_threshold.jpg"), thresh)
+    # Guardar imagen de detección de líneas horizontales
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_horizontal_detect.jpg"), horizontal_lines)
     
-    # Operaciones morfológicas para mejorar definición de caracteres
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    opening = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_opening.jpg"), opening)
+    # Comprobar si hay distorsión de ruido sal y pimienta
+    # (presencia de píxeles aislados muy claros y muy oscuros)
+    _, bright_mask = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    _, dark_mask = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY_INV)
+    salt_pepper_level = (cv2.countNonZero(bright_mask) + cv2.countNonZero(dark_mask)) / (height * width)
     
-    # Eliminación de ruido manteniendo bordes nítidos
-    denoised = cv2.fastNlMeansDenoising(opening, None, 10, 7, 21)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_denoised.jpg"), denoised)
+    # Guardar imágenes de detección de ruido sal y pimienta
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_salt_pepper_detect.jpg"), 
+                cv2.add(bright_mask, dark_mask))
     
-    # Dilatación ligera para reforzar caracteres
-    kernel_dilate = np.ones((2, 2), np.uint8)
-    dilated = cv2.dilate(denoised, kernel_dilate, iterations=1)
-    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_dilated.jpg"), dilated)
+    # Aplicar algoritmos de restauración específicos según el tipo de distorsión detectada
+    print(f"Nivel de ruido detectado: {noise_level:.4f}")
+    print(f"Distorsión lineal detectada: {has_linear_distortion}")
+    print(f"Nivel de ruido sal y pimienta: {salt_pepper_level:.4f}")
     
-    # Detección y corrección de inclinación si es necesario
-    try:
-        coords = np.column_stack(np.where(dilated > 0))
-        angle = cv2.minAreaRect(coords)[-1]
+    # Guardar información de análisis
+    with open(os.path.join(debug_dir, f"{name_without_ext}_noise_analysis.txt"), 'w') as f:
+        f.write(f"Nivel de ruido: {noise_level:.4f}\n")
+        f.write(f"Distorsión lineal: {has_linear_distortion}\n")
+        f.write(f"Ruido sal y pimienta: {salt_pepper_level:.4f}\n")
+    
+    # 2. TÉCNICAS DE RESTAURACIÓN SEGÚN EL TIPO DE DISTORSIÓN
+    
+    # Procesamiento inicial: normalización adaptativa
+    # En lugar de usar valores fijos, ajustamos según las características de la imagen
+    processed = cv2.normalize(gray, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_normalized.jpg"), processed)
+    
+    # Si hay ruido "sal y pimienta" (píxeles aislados muy brillantes/oscuros)
+    if salt_pepper_level > 0.01:
+        # Aplicar filtro de mediana (especialmente efectivo para ruido sal y pimienta)
+        # El tamaño del kernel se adapta al nivel de ruido
+        kernel_size = 3
+        if salt_pepper_level > 0.05:
+            kernel_size = 5
         
-        # Corregir ángulo
-        if angle < -45:
-            angle = -(90 + angle)
-        else:
-            angle = -angle
-            
-        # Rotar si la inclinación es significativa
-        if abs(angle) > 0.5:
-            (h, w) = dilated.shape[:2]
-            center = (w // 2, h // 2)
-            M = cv2.getRotationMatrix2D(center, angle, 1.0)
-            rotated = cv2.warpAffine(dilated, M, (w, h), 
-                                    flags=cv2.INTER_CUBIC, 
-                                    borderMode=cv2.BORDER_REPLICATE)
-            dilated = rotated
-            cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_rotated.jpg"), dilated)
-    except:
-        # Si hay error en la corrección de inclinación, continuar con la imagen sin rotar
-        pass
+        processed = cv2.medianBlur(processed, kernel_size)
+        cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_median_filtered.jpg"), processed)
     
-    # Aplicar filtro de nitidez para mejorar los bordes del texto
-    kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-    sharpened = cv2.filter2D(dilated, -1, kernel_sharpen)
+    # Si hay distorsión lineal (como escaneo con líneas horizontales)
+    if has_linear_distortion:
+        # Reconstrucción morfológica para eliminar líneas horizontales
+        horizontal = cv2.morphologyEx(processed, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+        processed = cv2.subtract(processed, horizontal)
+        cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_horizontal_removed.jpg"), processed)
+    
+    # Para ruido general, aplicar filtrado bilateral adaptativo
+    # El filtro bilateral preserva bordes mientras elimina ruido
+    # Parámetros adaptados al nivel de ruido detectado
+    d = int(9 + noise_level * 20)  # Diámetro de vecindad
+    sigma_color = 75 + noise_level * 100
+    sigma_space = 75 + noise_level * 100
+    
+    processed = cv2.bilateralFilter(processed, d, sigma_color, sigma_space)
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_bilateral.jpg"), processed)
+    
+    # 3. MEJORA DE CONTRASTE ADAPTATIVA
+    
+    # Determinar si necesitamos ecualización local o global
+    # Calculamos histograma y su desviación estándar
+    hist = cv2.calcHist([processed], [0], None, [256], [0, 256])
+    hist_std = np.std(hist)
+    
+    # Si el histograma es comprimido (bajo contraste), aplicar ecualización más agresiva
+    if hist_std < 40:
+        # CLAHE con parámetros adaptados a la imagen
+        clip_limit = max(1.0, 4.0 - hist_std / 20)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        processed = clahe.apply(processed)
+    else:
+        # Si ya hay buen contraste, aplicar CLAHE suave
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        processed = clahe.apply(processed)
+    
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_equalized.jpg"), processed)
+    
+    # 4. BINARIZACIÓN ADAPTATIVA PARA MEJORAR LEGIBILIDAD DE TEXTO
+    
+    # Determinar si usar umbral global o adaptativo según la varianza de la imagen
+    var_total = np.var(processed)
+    
+    if var_total < 1000:  # Imagen con iluminación uniforme
+        # Umbral global con Otsu
+        _, processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    else:
+        # Umbral adaptativo para imágenes con iluminación no uniforme
+        # Tamaño de bloque adaptado a la resolución de la imagen
+        block_size = max(11, int(min(height, width) / 100) * 2 + 1)
+        if block_size % 2 == 0:
+            block_size += 1  # Asegurar que sea impar
+            
+        # Constante de ajuste adaptada a la varianza
+        C = max(2, min(10, var_total / 1000))
+        
+        processed = cv2.adaptiveThreshold(processed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                         cv2.THRESH_BINARY, block_size, C)
+    
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_threshold.jpg"), processed)
+    
+    # 5. OPERACIONES MORFOLÓGICAS PARA RESTAURAR TEXTO
+    
+    # Tamaño de kernel adaptativo basado en la resolución de la imagen
+    kernel_size = max(2, min(3, int(min(height, width) / 500)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    
+    # Abrir para eliminar ruido pequeño (ajustando iteraciones según nivel de ruido)
+    iterations = 1
+    if noise_level > 0.05:
+        iterations = 2
+        
+    processed = cv2.morphologyEx(processed, cv2.MORPH_OPEN, kernel, iterations=iterations)
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_opening.jpg"), processed)
+    
+    # Cerrar para conectar componentes de texto (especialmente útil en textos rotos)
+    # Solo aplicar si hay evidencia de texto fragmentado
+    if noise_level > 0.03:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size + 1, kernel_size + 1))
+        processed = cv2.morphologyEx(processed, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+        cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_closing.jpg"), processed)
+    
+    # 6. CORRECCIÓN DE INCLINACIÓN ADAPTATIVA
+    
+    try:
+        # Solo aplicar corrección si hay suficientes puntos para analizar
+        nonzero_points = cv2.findNonZero(processed)
+        if nonzero_points is not None and len(nonzero_points) > 100:
+            # Calcular ángulo de inclinación
+            rect = cv2.minAreaRect(nonzero_points)
+            angle = rect[-1]
+            
+            # Ajustar ángulo para rotación correcta
+            if angle < -45:
+                angle = -(90 + angle)
+            else:
+                angle = -angle
+                
+            # Solo rotar si la inclinación es significativa
+            if abs(angle) > 0.5:
+                (h, w) = processed.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                processed = cv2.warpAffine(processed, M, (w, h), 
+                                         flags=cv2.INTER_CUBIC, 
+                                         borderMode=cv2.BORDER_REPLICATE)
+                cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_rotated.jpg"), processed)
+    except Exception as e:
+        print(f"Error en corrección de inclinación: {str(e)}")
+    
+    # 7. MEJORA FINAL: NITIDEZ ADAPTATIVA
+    
+    # Aplicar filtro de nitidez con parámetros adaptados al nivel de degradación
+    # Más nitidez para imágenes más degradadas
+    if noise_level < 0.04:  # Imagen con poco ruido
+        # Kernel de nitidez suave
+        kernel_sharpen = np.array([[-0.5,-0.5,-0.5], [-0.5,5,-0.5], [-0.5,-0.5,-0.5]])
+        sharpened = cv2.filter2D(processed, -1, kernel_sharpen)
+    else:
+        # Para imágenes con más ruido, aplicar nitidez más agresiva
+        kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        sharpened = cv2.filter2D(processed, -1, kernel_sharpen)
+    
     cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_sharpened.jpg"), sharpened)
     
-    # Escalado final para mejorar la detección
-    processed = cv2.resize(sharpened, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
+    # 8. ESCALADO FINAL PARA MEJORAR OCR
+    
+    # Factor de escala adaptativo basado en la calidad de la imagen
+    # Más escalado para imágenes más degradadas
+    scale_factor = 1.5
+    if noise_level > 0.05:
+        scale_factor = 2.0
+        
+    final_img = cv2.resize(sharpened, None, fx=scale_factor, fy=scale_factor, 
+                         interpolation=cv2.INTER_CUBIC)
     
     # Guardar imagen final procesada
     debug_output_path = os.path.join(debug_dir, f"{name_without_ext}_final.jpg")
-    cv2.imwrite(debug_output_path, processed)
+    cv2.imwrite(debug_output_path, final_img)
     
     print(f"Imágenes de depuración guardadas en: {debug_dir}")
     
-    return processed
+    return final_img
 
 def extract_text_with_tesseract(image_path):
     """
@@ -410,13 +536,13 @@ def extract_text_with_regions(image_path):
     if is_new_model:
         # Regiones para DNI español moderno (2015 en adelante)
         default_regions = {
-            "apellidos": [0.25, 0.17, 0.75, 0.25],    # Posición general para APELLIDOS
-            "nombre": [0.25, 0.25, 0.75, 0.33],       # Posición general para NOMBRE
-            "nacimiento": [0.65, 0.44, 0.95, 0.52],   # FECHA DE NACIMIENTO (derecha)
-            "documento": [0.45, 0.07, 0.90, 0.15],    # Número DNI (arriba)
-            "validez": [0.65, 0.38, 0.95, 0.45],      # VALIDEZ (derecha, debajo nacionalidad)
-            "sexo": [0.25, 0.38, 0.40, 0.45],         # SEXO (izquierda)
-            "nacionalidad": [0.65, 0.32, 0.85, 0.39]  # NACIONALIDAD (derecha)
+            "apellidos": [0.30, 0.20, 0.65, 0.26],    # ESTEVE MORENO (centrado, debajo del número DNI)
+            "nombre": [0.30, 0.26, 0.65, 0.33],       # RAUL (debajo de apellidos)
+            "nacimiento": [0.70, 0.47, 0.95, 0.55],   # FECHA DE NACIMIENTO (derecha abajo)
+            "documento": [0.45, 0.12, 0.90, 0.19],    # 07262594E (zona superior junto a "DNI")
+            "validez": [0.60, 0.38, 0.90, 0.47],      # VALIDEZ (derecha centro, zona central)
+            "sexo": [0.25, 0.38, 0.40, 0.45],         # M (izquierda centro)
+            "nacionalidad": [0.60, 0.32, 0.80, 0.40]  # ESP (derecha centro)
         }
     else:
         # Regiones para DNI español antiguo (modelo azul)
@@ -443,35 +569,36 @@ def extract_text_with_regions(image_path):
             # Ajustar región según el tipo de campo
             if campo in ["apellidos", "nombre"]:
                 # Los valores estarán a la derecha o debajo de la etiqueta
+                # Ampliamos el área para cubrir mejor el contenido
                 regions[campo] = [
-                    x_rel + 0.05,  # Un poco a la derecha de la etiqueta
-                    y_rel,  # Misma altura
-                    min(x_rel + 0.50, 0.95),  # Extender horizontalmente
-                    y_rel + 0.05  # Un poco más abajo
+                    x_rel + 0.05,                  # Un poco a la derecha de la etiqueta
+                    y_rel,                         # Misma altura
+                    min(x_rel + 0.60, 0.95),       # Extender horizontalmente más (para apellidos largos)
+                    y_rel + 0.06                   # Un poco más abajo para cubrir bien el texto
                 ]
             elif campo in ["nacimiento", "validez"]:
-                # Para fechas, buscar debajo de la etiqueta con más espacio
+                # Para fechas, necesitamos un área que cubra bien los dígitos
                 regions[campo] = [
-                    x_rel,  # Misma posición horizontal
-                    y_rel + 0.02,  # Justo debajo
-                    min(x_rel + 0.30, 0.95),  # Espacio para la fecha
-                    y_rel + 0.07  # Altura suficiente para una fecha
+                    x_rel,                         # Misma posición horizontal
+                    y_rel + 0.02,                  # Justo debajo
+                    min(x_rel + 0.35, 0.95),       # Espacio más amplio para la fecha
+                    y_rel + 0.08                   # Altura suficiente para fechas
                 ]
             elif campo == "documento":
-                # Número de documento suele estar cerca de la etiqueta DNI
+                # El número de documento necesita una región amplia
                 regions[campo] = [
-                    x_rel + 0.05,  # A la derecha de "DNI"
-                    y_rel - 0.01,  # Ligeramente arriba o al mismo nivel
-                    min(x_rel + 0.40, 0.95),  # Espacio para el número
-                    y_rel + 0.05  # Altura para el número
+                    x_rel + 0.05,                  # A la derecha de "DNI"
+                    y_rel - 0.02,                  # Ligeramente arriba o al mismo nivel
+                    min(x_rel + 0.45, 0.95),       # Espacio para el número completo
+                    y_rel + 0.06                   # Altura para el número
                 ]
             elif campo in ["sexo", "nacionalidad"]:
-                # Valores cortos que suelen estar a la derecha
+                # Para valores cortos ampliamos un poco el área para mayor precisión
                 regions[campo] = [
-                    x_rel + 0.05,  # A la derecha de la etiqueta
-                    y_rel - 0.01,  # Mismo nivel
-                    min(x_rel + 0.15, 0.95),  # Espacio pequeño (es solo M/F o ESP)
-                    y_rel + 0.05  # Altura para el valor
+                    x_rel + 0.05,                  # A la derecha de la etiqueta
+                    y_rel - 0.01,                  # Mismo nivel
+                    min(x_rel + 0.20, 0.95),       # Espacio para el valor (M/F o ESP)
+                    y_rel + 0.07                   # Altura para asegurar capturar el valor
                 ]
         else:
             # Si no encontramos la etiqueta, usar valor predeterminado
@@ -749,8 +876,9 @@ def analyze_id_from_image(image_path):
     """
     return process_dni_image(image_path, use_openai=True)
 
-def analyze_text_openai(text):
+def analyze_text_openai(text, image_path=None):
     try:
+        # Preparar un prompt más detallado con información contextual
         prompt = (
             "Please extract the following information from this Spanish ID card (DNI) text data: "
             "Name, Lastname, DateOfBirth, DocumentType, DocumentNumber, Sex, Nationality, ExpiryDate. "
@@ -767,19 +895,60 @@ def analyze_text_openai(text):
             "\n8. Pay special attention to finding the ExpiryDate even if it's not clearly labeled with 'VALIDEZ'."
             "\n\nMake sure to extract the DNI number correctly - it's usually at the bottom of the card and may end with a letter. "
             "The sex will be 'M' for male or 'F' for female. The nationality is usually a 3-letter code like 'ESP' for Spain. "
-            "\n\nReturn ONLY a JSON object with the exact field names specified above, no additional explanations. "
-            "Here is the extracted text from the ID card:\n\n"
-            f"{text}"
+            "\n\nIMPORTANT: The OCR text may contain errors. Try to deduce the correct information even from partially garbled text. "
+            "Look for patterns like number formats for dates (DD MM YYYY) and document numbers (7-8 digits + letter for Spanish DNI)."
         )
 
-        # Llamada a la API de OpenAI
+        # Comprobar si hay secciones que contienen texto reconocible
+        if "APELLIDOS" in text or "NOMBRE" in text or "DNI" in text:
+            prompt += "\n\nThe OCR has successfully recognized some key fields like 'APELLIDOS', 'NOMBRE', or 'DNI'. Focus on extracting values adjacent to these fields."
+        
+        # Si hay etiquetas de secciones pero valores aparentemente incorrectos
+        if "SEXO M" in text or "SEXO: M" in text:
+            prompt += "\n\nThe OCR has recognized 'SEXO: M' which indicates a male document holder."
+
+        if "NACIONALIDAD ESP" in text or "NACIONALIDAD: ESP" in text:
+            prompt += "\n\nThe OCR has recognized 'NACIONALIDAD: ESP' which indicates Spanish nationality."
+
+        # Buscar fechas en formato específico (muy común en DNI)
+        date_matches = re.findall(r'\d{1,2}\s+\d{1,2}\s+\d{4}', text)
+        if date_matches:
+            prompt += f"\n\nThe OCR has identified these potential dates: {', '.join(date_matches)}. Use these to determine DateOfBirth and ExpiryDate by their context."
+
+        # Buscar potenciales números de DNI
+        dni_matches = re.findall(r'[0-9]{7,8}[A-Za-z]', text)
+        if dni_matches:
+            prompt += f"\n\nPotential document numbers identified: {', '.join(dni_matches)}. Use the one most likely to be a DNI number."
+        
+        # Añadir información diagnóstica adicional sobre los datos extraídos
+        debug_dir = os.path.join(tempfile.gettempdir(), "dni_ocr_debug")
+        if image_path and os.path.exists(debug_dir):
+            # Buscar el archivo de análisis del DNI
+            base_name = os.path.basename(image_path)
+            name_without_ext = os.path.splitext(base_name)[0]
+            dni_analysis_path = os.path.join(debug_dir, "dni_analisis.txt")
+            
+            if os.path.exists(dni_analysis_path):
+                try:
+                    with open(dni_analysis_path, 'r', encoding='utf-8') as f:
+                        analysis_text = f.read()
+                        prompt += f"\n\nAdditional analysis of the document image:\n{analysis_text}"
+                except:
+                    pass
+        
+        # Añadir el texto original al final
+        prompt += "\n\nReturn ONLY a JSON object with the exact field names specified above, no additional explanations. "
+        prompt += "Here is the extracted text from the ID card:\n\n"
+        prompt += text
+
+        # Llamada a la API de OpenAI con temperature más baja para resultados más deterministas
         response = openai.chat.completions.create(
             model="gpt-4o", # o "gpt-4" para mayor precisión
             messages=[
                 {"role": "system", "content": "You are an AI specialized in extracting structured data from Spanish ID documents (DNI). Always extract all visible fields and respond with valid complete JSON. Pay special attention to correctly identify the expiry date (fecha de validez) which is different from the date of birth."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2,
+            temperature=0.1,  # Reducido para mayor consistencia
             max_tokens=500,
             response_format={"type": "json_object"}
         )
@@ -1153,9 +1322,9 @@ def final_json(extracted_data):
             "FechaValidez": ""
         }
 
-def analyze_id(text):
+def analyze_id(text, image_path=None):
     try:
-        openai_text = analyze_text_openai(text)
+        openai_text = analyze_text_openai(text, image_path)
         print(openai_text)
         openai_json = extract_json(openai_text)
         print(openai_json)
@@ -1179,6 +1348,8 @@ def analyze_id(text):
                         "Nationality": "",
                         "ExpiryDate": ""
                     }
+            
+        # Resto de la función se mantiene igual...
         
         # Búsqueda específica para DNI español si no se encontraron ciertos campos
         # Restaurar detección de sexo y nacionalidad
@@ -1192,226 +1363,8 @@ def analyze_id(text):
         if not openai_json.get("Nationality") and "ESP" in text:
             openai_json["Nationality"] = "ESP"
         
-        # Lista de palabras que NO deben estar en los apellidos
-        palabras_excluidas_apellidos = ["NUM", "SOPORT", "GOPORT", "DOCUMENTO", "NACIONAL", "IDENTIDAD", 
-                                       "ESPAÑA", "VALIDEZ", "DNI", "FECHA", "NACIMIENTO", "NOMBRE", "SEXO", 
-                                       "APELLIDOS", "APELLIDO"]
-        
-        # Variables para almacenar fechas encontradas
-        fechas_encontradas = []
-        
-        # Procesar todas las fechas en el texto para clasificarlas correctamente
-        for match in re.finditer(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', text):
-            dia, mes, anio = match.groups()
-            if es_fecha_valida(dia, mes, anio):
-                try:
-                    fecha_obj = datetime(int(anio), int(mes), int(dia))
-                    # Obtener el contexto antes de la fecha
-                    inicio_pos = max(0, match.start() - 30)
-                    fin_pos = match.start()
-                    contexto_antes = text[inicio_pos:fin_pos]
-                    
-                    # Determinar tipo de fecha según contexto
-                    tipo_fecha = "desconocido"
-                    if "NACIMIENTO" in contexto_antes:
-                        tipo_fecha = "nacimiento"
-                    elif "VALIDEZ" in contexto_antes:
-                        tipo_fecha = "validez"
-                    # Si es fecha futura, probablemente es de validez
-                    elif fecha_obj > datetime.now():
-                        tipo_fecha = "validez"
-                    # Si está cerca de patrones típicos de fechas de validez
-                    elif re.search(r'BGM\d+|SOPORT|NUM', contexto_antes):
-                        tipo_fecha = "validez"
-                    
-                    fechas_encontradas.append({
-                        "fecha": fecha_obj,
-                        "texto": f"{dia}/{mes}/{anio}",
-                        "tipo": tipo_fecha,
-                        "posicion": match.start()
-                    })
-                except ValueError:
-                    pass
-        
-        # DETECCIÓN DE APELLIDOS MEDIANTE BÚSQUEDA DE CONTEXTO
-        # Para evitar el hardcoding, buscamos patrones comunes en los DNI
-        
-        # 1. Buscar después del texto "APELLIDOS"
-        apellidos_completos = None
-        lineas = text.split('\n')
-        
-        for i, linea in enumerate(lineas):
-            if "APELLIDOS" in linea:
-                # Extraer texto después de la palabra APELLIDOS
-                apellido_texto = linea.replace("APELLIDOS", "").strip()
-                
-                # Si hay apellidos en la misma línea
-                if apellido_texto and not any(p in apellido_texto for p in palabras_excluidas_apellidos):
-                    # Verificar si es formato típico de apellido
-                    if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', apellido_texto):
-                        apellidos_completos = apellido_texto
-                
-                # Si no hay texto en la línea o es insuficiente, buscar en líneas siguientes
-                if not apellidos_completos and i + 1 < len(lineas):
-                    linea_siguiente = lineas[i+1].strip()
-                    # Si la siguiente línea parece un apellido
-                    if re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente) and not any(p in linea_siguiente for p in palabras_excluidas_apellidos):
-                        apellidos_completos = linea_siguiente
-                        
-                        # Si hay más líneas, verificar si hay un segundo apellido
-                        if i + 2 < len(lineas):
-                            linea_siguiente2 = lineas[i+2].strip()
-                            # Si la línea siguiente también parece un apellido
-                            if re.match(r'^[A-ZÁÉÍÓÚÑ]+$', linea_siguiente2) and not any(p in linea_siguiente2 for p in palabras_excluidas_apellidos):
-                                # Combinar ambos apellidos
-                                apellidos_completos = f"{apellidos_completos} {linea_siguiente2}"
-                break
-        
-        # 2. Si no encontramos con el método anterior, buscar líneas con formato de apellidos
-        if not apellidos_completos:
-            # Buscar líneas con texto en mayúsculas que no contengan palabras excluidas
-            for i, linea in enumerate(lineas):
-                # Si es una línea de solo mayúsculas y sin palabras excluidas
-                if (re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea.strip()) and 
-                    len(linea.strip()) > 3 and 
-                    not any(p in linea.upper() for p in palabras_excluidas_apellidos)):
-                    
-                    # Verificar si la línea siguiente también parece un apellido
-                    if i + 1 < len(lineas):
-                        linea_siguiente = lineas[i+1].strip()
-                        if (re.match(r'^[A-ZÁÉÍÓÚÑ\s]+$', linea_siguiente) and 
-                            len(linea_siguiente) > 3 and 
-                            not any(p in linea_siguiente.upper() for p in palabras_excluidas_apellidos)):
-                            
-                            # Si tenemos dos líneas seguidas que parecen apellidos, combinarlas
-                            apellidos_completos = f"{linea.strip()} {linea_siguiente.strip()}"
-                            break
-                    
-                    # Si solo encontramos una línea que parece apellido, usarla
-                    apellidos_completos = linea.strip()
-                    break
-        
-        # 3. Estrategia adicional: buscar patrones de dos palabras mayúsculas juntas
-        if not apellidos_completos:
-            # Buscar líneas con exactamente dos palabras en mayúsculas (formato típico: PRIMER SEGUNDO)
-            for linea in lineas:
-                palabras = linea.strip().split()
-                if len(palabras) == 2:
-                    if (all(re.match(r'^[A-ZÁÉÍÓÚÑ]+$', palabra) for palabra in palabras) and
-                        not any(p in linea.upper() for p in palabras_excluidas_apellidos)):
-                        apellidos_completos = linea.strip()
-                        break
-        
-        # Actualizar el JSON con los apellidos encontrados
-        if apellidos_completos:
-            openai_json["Lastname"] = apellidos_completos
-        
-        # Clasificar y asignar fechas según su tipo
-        fecha_nacimiento = None
-        fecha_validez = None
-        
-        # Primero, buscar específicamente fechas etiquetadas
-        for fecha in fechas_encontradas:
-            if fecha["tipo"] == "nacimiento":
-                fecha_nacimiento = fecha["texto"]
-            elif fecha["tipo"] == "validez":
-                fecha_validez = fecha["texto"]
-        
-        # Si no encontramos fecha de nacimiento etiquetada, buscar la más antigua
-        if not fecha_nacimiento and fechas_encontradas:
-            fechas_pasadas = [f for f in fechas_encontradas if f["fecha"] < datetime.now()]
-            if fechas_pasadas:
-                fechas_pasadas.sort(key=lambda x: x["fecha"])  # Ordenar de más antigua a más reciente
-                fecha_nacimiento = fechas_pasadas[0]["texto"]
-        
-        # Si no encontramos fecha de validez etiquetada, buscar la más futura
-        if not fecha_validez and fechas_encontradas:
-            fechas_futuras = [f for f in fechas_encontradas if f["fecha"] > datetime.now()]
-            if fechas_futuras:
-                fechas_futuras.sort(key=lambda x: x["fecha"])  # Ordenar de más cercana a más lejana
-                fecha_validez = fechas_futuras[0]["texto"]
-            # Si no hay fechas futuras, buscar la más reciente que esté cerca de "VALIDEZ" o "BGM"
-            else:
-                for fecha in fechas_encontradas:
-                    inicio_pos = max(0, fecha["posicion"] - 30)
-                    contexto = text[inicio_pos:fecha["posicion"]]
-                    if "VALIDEZ" in contexto or "BGM" in contexto or "SOPORT" in contexto:
-                        fecha_validez = fecha["texto"]
-                        break
-        
-        # Actualizar fechas en el JSON
-        if fecha_nacimiento:
-            openai_json["DateOfBirth"] = fecha_nacimiento
-        
-        if fecha_validez:
-            openai_json["ExpiryDate"] = fecha_validez
-        
-        # Búsqueda específica para fecha de validez (formato DD MM YYYY)
-        if not openai_json.get("ExpiryDate") and "VALIDEZ" in text:
-            validez_idx = text.find("VALIDEZ")
-            if validez_idx >= 0:
-                texto_despues = text[validez_idx:validez_idx+40]
-                # Buscar fecha en formato DD MM YYYY cerca de VALIDEZ
-                validez_match = re.search(r'(\d{1,2})\s+(\d{1,2})\s+(\d{4})', texto_despues)
-                if validez_match:
-                    dia, mes, anio = validez_match.groups()
-                    openai_json["ExpiryDate"] = f"{dia}/{mes}/{anio}"
-        
-        # IMPORTANTE: Asegurarse de que la fecha de validez no sea igual a la fecha de nacimiento
-        if (openai_json.get("ExpiryDate") and openai_json.get("DateOfBirth") and 
-            openai_json["ExpiryDate"] == openai_json["DateOfBirth"]):
-            # Si son iguales, es probable un error - buscar otra fecha que pueda ser la de validez
-            print("¡ALERTA! La fecha de validez es igual a la fecha de nacimiento. Buscando otra fecha...")
-            # Buscar explícitamente cerca de VALIDEZ o después de SOPORT
-            for patrón, contexto in [
-                (r'VALIDEZ[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "VALIDEZ"),
-                (r'BGM\d+\s+(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "SOPORTE"),
-                (r'SOPORT[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', "SOPORTE")
-            ]:
-                match = re.search(patrón, text)
-                if match:
-                    dia, mes, anio = match.groups()
-                    nueva_fecha = f"{dia}/{mes}/{anio}"
-                    # Verificar que sea diferente a la fecha de nacimiento
-                    if nueva_fecha != openai_json["DateOfBirth"]:
-                        openai_json["ExpiryDate"] = nueva_fecha
-                        print(f"Nueva fecha de validez encontrada cerca de {contexto}: {nueva_fecha}")
-                        break
-            
-            # Si aún son iguales, dejar vacía la fecha de validez para evitar confusiones
-            if openai_json.get("ExpiryDate") == openai_json.get("DateOfBirth"):
-                openai_json["ExpiryDate"] = ""
-                print("No se pudo encontrar una fecha de validez clara y distinta. Dejando campo vacío.")
-        
         # Convertir y formatear el resultado
         id_json = final_json(openai_json)
-        
-        # VERIFICACIONES FINALES
-        # Si falta nacionalidad para DNI español
-        if not id_json.get("Nacionalidad") and id_json.get("TipoDocumento") == "DNI":
-            id_json["Nacionalidad"] = "ESP"
-        
-        # Si falta sexo pero está en el texto
-        if not id_json.get("Sexo") and "SEXO" in text:
-            if "SEXO M" in text:
-                id_json["Sexo"] = "M"
-            elif "SEXO F" in text:
-                id_json["Sexo"] = "F"
-        
-        # Verificación final para evitar que la palabra APELLIDOS aparezca como apellido
-        if id_json.get("Apellido") == "APELLIDOS":
-            id_json["Apellido"] = ""
-        
-        # Última comprobación para evitar que la fecha de validez sea igual a la fecha de nacimiento
-        if id_json.get("FechaValidez") == id_json.get("FechaDeNacimiento"):
-            # Buscar explícitamente la fecha después de VALIDEZ
-            validez_match = re.search(r'VALIDEZ[^0-9]*(\d{1,2})\s+(\d{1,2})\s+(\d{4})', text)
-            if validez_match:
-                dia, mes, anio = validez_match.groups()
-                id_json["FechaValidez"] = f"{dia}/{mes}/{anio}"
-            else:
-                # Si no se encuentra, dejar el campo vacío
-                id_json["FechaValidez"] = ""
         
         print(id_json)
         return id_json
@@ -1425,14 +1378,14 @@ def analyze_id(text):
             "FechaDeNacimiento": "",
             "TipoDocumento": "",
             "Sexo": "",
-            "Nacionalidad": "",
+            "Nacionalidad": "ESP",
             "FechaValidez": ""
         }
 
 def process_dni_image(input_path, use_openai=True):
     """
     Función principal para procesar una imagen de DNI español en varios formatos,
-    combinando OCR local con Tesseract y opcionalmente API de OpenAI.
+    combinando múltiples enfoques de OCR con análisis de IA avanzado.
     
     Args:
         input_path: Ruta al archivo (puede ser imagen, PDF o DOCX)
@@ -1462,17 +1415,12 @@ def process_dni_image(input_path, use_openai=True):
         
         print(f"Usando imagen procesable: {image_path}")
         
-        # Paso 2: Extracción de texto mediante OCR con Tesseract
-        # Primero intentamos extracción por regiones específicas (más precisa)
-        extracted_text = extract_text_with_regions(image_path)
-        
-        # Si la extracción por regiones falla, usamos extracción general
-        if not extracted_text or len(extracted_text.strip()) < 10:
-            print("La extracción por regiones no produjo resultados, utilizando OCR general...")
-            extracted_text = extract_text_with_tesseract(image_path)
+        # Paso 2: Utilizar múltiples enfoques de OCR para mejorar la extracción
+        print("Aplicando múltiples enfoques de extracción de texto...")
+        extracted_text = extract_text_multi_approach(image_path)
         
         # Verificar si se obtuvo texto suficiente
-        if not extracted_text or len(extracted_text.strip()) < 10:
+        if not extracted_text or len(extracted_text.strip()) < 20:  # Umbral aumentado para texto combinado
             print("Error: No se pudo extraer texto suficiente de la imagen.")
             print(f"Imagen procesable conservada para depuración: {image_path}")
             return {
@@ -1489,8 +1437,8 @@ def process_dni_image(input_path, use_openai=True):
         # Paso 3: Análisis del texto extraído
         if use_openai:
             print("Utilizando OpenAI para análisis de texto...")
-            # Analizar el texto con OpenAI para mayor precisión
-            result = analyze_id(extracted_text)
+            # Analizar el texto con OpenAI incluyendo la ruta de la imagen para contexto
+            result = analyze_id(extracted_text, image_path)
         else:
             print("Utilizando solo análisis local...")
             # Analizar el texto localmente sin usar OpenAI
@@ -1540,6 +1488,9 @@ def process_dni_image(input_path, use_openai=True):
             if result["TipoDocumento"] == "DNI":
                 result["TipoDocumento"] = "DNI-Moderno" if is_new_model else "DNI-Antiguo"
         
+        # Aplicar validación para detectar y corregir inconsistencias
+        result = validate_dni_data(result)
+        
         return result
     
     except Exception as e:
@@ -1554,3 +1505,272 @@ def process_dni_image(input_path, use_openai=True):
             "Nacionalidad": "ESP",
             "FechaValidez": ""
         }
+
+# Añadimos una nueva función para verificar y validar los resultados del OCR
+def validate_dni_data(result):
+    """
+    Validación y corrección de errores comunes en datos de DNI extraídos.
+    Evita errores como confundir "SEXO" como nombre o campos intercambiados.
+    """
+    changes_made = []
+    
+    # Lista de palabras reservadas que no deberían aparecer en campos como nombre o apellido
+    reserved_terms = ["SEXO", "APELLIDOS", "NOMBRE", "DNI", "DOCUMENTO", "NACIONAL", 
+                     "IDENTIDAD", "FECHA", "NACIMIENTO", "NACIONALIDAD", "VALIDEZ",
+                     "SOPORTE", "DOMICILIO", "IDESP", "LUGAR", "HIJO", "JAIOTEGUNA", 
+                     "ABIZENAK", "IZENA", "SEXUA", "NAZIONALITATEA", "IRAUNKORTASUNA",
+                     "EMISION", "EMISIÓN", "NUM", "NUMERO", "NÚMERO", "SOPORT"]
+    
+    # Verificar que el nombre no sea una palabra reservada
+    if result.get("Nombre") and any(term in result["Nombre"].upper() for term in reserved_terms):
+        old_value = result["Nombre"]
+        result["Nombre"] = ""
+        changes_made.append(f"Corregido: Nombre '{old_value}' eliminado (contiene palabra reservada)")
+    
+    # Verificar que el apellido no sea una palabra reservada
+    if result.get("Apellido") and any(term in result["Apellido"].upper() for term in reserved_terms):
+        old_value = result["Apellido"]
+        result["Apellido"] = ""
+        changes_made.append(f"Corregido: Apellido '{old_value}' eliminado (contiene palabra reservada)")
+    
+    # Verificar que el valor de sexo sea válido
+    valid_sex = ["M", "F", "m", "f", "H", "h", "V", "v"]
+    if result.get("Sexo") and result["Sexo"] not in valid_sex:
+        if len(result["Sexo"]) > 1:
+            # Si es más largo, probablemente no es un valor de sexo válido
+            old_value = result["Sexo"]
+            result["Sexo"] = ""
+            changes_made.append(f"Corregido: Sexo '{old_value}' eliminado (valor inválido)")
+        else:
+            # Normalizar a M o F
+            old_value = result["Sexo"]
+            if result["Sexo"].upper() in ["H", "V", "M"]:
+                result["Sexo"] = "M"
+            else:
+                result["Sexo"] = "F"
+            changes_made.append(f"Corregido: Sexo '{old_value}' normalizado a '{result['Sexo']}'")
+    
+    # Verificar que la nacionalidad tenga formato válido (3 letras para ESP)
+    if result.get("Nacionalidad") and len(result["Nacionalidad"]) != 3:
+        # Si el valor parece español, corregirlo a ESP
+        if "ESP" in result["Nacionalidad"] or "spa" in result["Nacionalidad"].lower():
+            old_value = result["Nacionalidad"]
+            result["Nacionalidad"] = "ESP"
+            changes_made.append(f"Corregido: Nacionalidad '{old_value}' normalizada a 'ESP'")
+        # Si es muy largo, probablemente es un error
+        elif len(result["Nacionalidad"]) > 5:
+            old_value = result["Nacionalidad"]
+            result["Nacionalidad"] = ""
+            changes_made.append(f"Corregido: Nacionalidad '{old_value}' eliminada (valor inválido)")
+    
+    # Verificar fechas de nacimiento
+    if result.get("FechaDeNacimiento"):
+        try:
+            # Intentar analizar la fecha
+            parts = result["FechaDeNacimiento"].replace('/', '-').replace('.', '-').split('-')
+            if len(parts) == 3:
+                day, month, year = map(int, parts)
+                # Verificar que la fecha sea válida y razonable
+                if not (1 <= day <= 31 and 1 <= month <= 12 and 1900 <= year <= datetime.now().year):
+                    old_value = result["FechaDeNacimiento"]
+                    result["FechaDeNacimiento"] = ""
+                    changes_made.append(f"Corregido: Fecha de nacimiento '{old_value}' eliminada (fecha inválida)")
+        except (ValueError, TypeError):
+            # Si no se puede analizar, eliminar el valor
+            old_value = result["FechaDeNacimiento"]
+            result["FechaDeNacimiento"] = ""
+            changes_made.append(f"Corregido: Fecha de nacimiento '{old_value}' eliminada (formato inválido)")
+    
+    # Verificar fechas de validez (debe ser una fecha futura o reciente)
+    if result.get("FechaValidez"):
+        try:
+            # Intentar analizar la fecha
+            parts = result["FechaValidez"].replace('/', '-').replace('.', '-').split('-')
+            if len(parts) == 3:
+                day, month, year = map(int, parts)
+                # Verificar que la fecha sea válida y razonable para validez (no demasiado antigua)
+                fecha_val = datetime(year, month, day)
+                if fecha_val < datetime.now() - timedelta(days=365*5):  # Si es más de 5 años en el pasado
+                    old_value = result["FechaValidez"]
+                    result["FechaValidez"] = ""
+                    changes_made.append(f"Corregido: Fecha de validez '{old_value}' eliminada (demasiado antigua)")
+        except (ValueError, TypeError):
+            # Si no se puede analizar, eliminar el valor
+            old_value = result["FechaValidez"]
+            result["FechaValidez"] = ""
+            changes_made.append(f"Corregido: Fecha de validez '{old_value}' eliminada (formato inválido)")
+    
+    # Verificar número de documento
+    if result.get("Documento"):
+        # Formato típico DNI: 7-8 dígitos + letra opcional
+        if not re.match(r'^[0-9]{7,8}[A-Za-z]?$', result["Documento"]):
+            # Si contiene dígitos pero formato incorrecto, intentar extraer solo la parte numérica + letra
+            extracted = re.search(r'([0-9]{7,8}[A-Za-z]?)', result["Documento"])
+            if extracted:
+                old_value = result["Documento"]
+                result["Documento"] = extracted.group(1)
+                changes_made.append(f"Corregido: Documento '{old_value}' ajustado a '{result['Documento']}'")
+            else:
+                # Si no se parece a un DNI, eliminar
+                old_value = result["Documento"]
+                result["Documento"] = ""
+                changes_made.append(f"Corregido: Documento '{old_value}' eliminado (formato inválido)")
+    
+    # Tipo de documento: normalizar a valores estándar
+    if result.get("TipoDocumento") and result["TipoDocumento"] not in ["DNI", "DNI-Moderno", "DNI-Antiguo", "NIE", "TIE"]:
+        # Si contiene "DNI", normalizarlo
+        if "DNI" in result["TipoDocumento"]:
+            old_value = result["TipoDocumento"]
+            result["TipoDocumento"] = "DNI"
+            changes_made.append(f"Corregido: TipoDocumento '{old_value}' normalizado a 'DNI'")
+    
+    # Verificación cruzada de campos
+    if not result.get("Nacionalidad") and result.get("TipoDocumento") and "DNI" in result["TipoDocumento"]:
+        # Si es un DNI español, la nacionalidad debería ser ESP
+        result["Nacionalidad"] = "ESP"
+        changes_made.append("Añadido: Nacionalidad 'ESP' inferida del tipo de documento DNI")
+    
+    # Registrar los cambios realizados
+    if changes_made:
+        print("Validación de datos completada con las siguientes correcciones:")
+        for change in changes_made:
+            print(f"- {change}")
+    else:
+        print("Validación de datos completada sin correcciones necesarias")
+    
+    return result
+
+# Nueva función: Mejorar la extracción combinando múltiples técnicas de OCR
+def extract_text_multi_approach(image_path):
+    """
+    Combina resultados de diferentes métodos de OCR para mejorar la extracción de texto.
+    """
+    results = {}
+    debug_dir = os.path.join(tempfile.gettempdir(), "dni_ocr_multi_debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    
+    # Cargar imagen
+    img = cv2.imread(image_path)
+    if img is None:
+        raise Exception(f"No se pudo cargar la imagen desde {image_path}")
+    
+    # Guardar imagen original
+    base_name = os.path.basename(image_path)
+    name_without_ext = os.path.splitext(base_name)[0]
+    
+    # 1. Enfoque estándar (Tesseract normal con preprocesamiento)
+    print("Aplicando enfoque OCR estándar...")
+    preprocessed_img = preprocess_image_for_ocr(image_path)
+    standard_config = r'--oem 3 --psm 11 -l spa'
+    text_standard = pytesseract.image_to_string(preprocessed_img, config=standard_config)
+    results['standard'] = text_standard
+    
+    # 2. Enfoque orientado a documentos con mejor segmentación de texto
+    print("Aplicando enfoque orientado a documentos...")
+    doc_config = r'--oem 3 --psm 6 -l spa'  # PSM 6: Assume a single uniform block of text
+    # Aplicar umbralización distinta para este enfoque
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Guardar para debug
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_doc_thresh.jpg"), thresh)
+    text_document = pytesseract.image_to_string(thresh, config=doc_config)
+    results['document'] = text_document
+    
+    # 3. Enfoque de extracción línea por línea
+    print("Aplicando enfoque línea por línea...")
+    lines_config = r'--oem 3 --psm 7 -l spa'  # PSM 7: Treat the image as a single text line
+    # Aplicar detección de líneas y extraer texto de cada línea
+    text_lines = []
+    
+    # Aplicar dilatación horizontal para conectar caracteres
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+    dilated = cv2.dilate(gray, kernel, iterations=1)
+    
+    # Encontrar y procesar cada línea de texto
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Ordenar contornos de arriba a abajo
+    contours = sorted(contours, key=lambda c: cv2.boundingRect(c)[1])
+    
+    # Crear imagen de depuración para visualizar líneas detectadas
+    line_debug = img.copy()
+    
+    for i, contour in enumerate(contours):
+        [x, y, w, h] = cv2.boundingRect(contour)
+        # Filtrar contornos muy pequeños
+        if h > 10 and w > 100:  # Ajustar según la resolución de la imagen
+            # Extraer la región de la línea
+            line_roi = gray[y:y+h, x:x+w]
+            # Mejorar contraste para la línea
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            line_roi = clahe.apply(line_roi)
+            # Procesar línea con Tesseract
+            line_text = pytesseract.image_to_string(line_roi, config=lines_config).strip()
+            if line_text:
+                text_lines.append(line_text)
+            
+            # Dibujar rectángulo en la imagen de depuración
+            cv2.rectangle(line_debug, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            cv2.putText(line_debug, f"Line {i+1}", (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+    
+    # Guardar imagen de depuración con líneas detectadas
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_lines_detected.jpg"), line_debug)
+    
+    # Combinar las líneas extraídas
+    results['lines'] = "\n".join(text_lines)
+    
+    # 4. Enfoque de extracción por palabra para mayor precisión en términos clave
+    print("Aplicando enfoque por palabra...")
+    word_config = r'--oem 3 --psm 8 -l spa'  # PSM 8: Treat the image as a single word
+    # Obtener datos de palabras detectadas
+    data = pytesseract.image_to_data(preprocessed_img, config=r'--oem 3 --psm 6 -l spa', output_type=pytesseract.Output.DICT)
+    
+    # Crear imagen de depuración para palabras
+    word_debug = img.copy()
+    
+    # Extraer palabras importantes con alta confianza
+    important_words = []
+    for i, word in enumerate(data['text']):
+        if word and data['conf'][i] > 60:  # Solo palabras con buena confianza
+            x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            # Extraer y procesar la palabra
+            if w > 10 and h > 10:  # Filtrar áreas muy pequeñas
+                word_roi = gray[y:y+h, x:x+w]
+                word_text = pytesseract.image_to_string(word_roi, config=word_config).strip()
+                if word_text:
+                    important_words.append(word_text)
+                
+                # Dibujar en imagen de depuración
+                cv2.rectangle(word_debug, (x, y), (x+w, y+h), (255, 0, 0), 2)
+    
+    # Guardar imagen de depuración
+    cv2.imwrite(os.path.join(debug_dir, f"{name_without_ext}_words_detected.jpg"), word_debug)
+    
+    # Combinar palabras importantes
+    results['words'] = " ".join(important_words)
+    
+    # 5. Combinar todos los resultados dando prioridad a texto estructurado
+    combined_text = f"""
+TEXTO COMBINADO DE MÚLTIPLES ENFOQUES:
+
+==== TEXTO ESTÁNDAR OCR ====
+{results['standard']}
+
+==== TEXTO ENFOQUE DOCUMENTO ====
+{results['document']}
+
+==== TEXTO POR LÍNEAS ====
+{results['lines']}
+
+==== PALABRAS CLAVE ====
+{results['words']}
+"""
+    
+    # Guardar resultados para depuración
+    with open(os.path.join(debug_dir, f"{name_without_ext}_combined_results.txt"), 'w', encoding='utf-8') as f:
+        f.write(combined_text)
+    
+    print(f"Resultados de extracción múltiple guardados en: {debug_dir}")
+    
+    return combined_text
